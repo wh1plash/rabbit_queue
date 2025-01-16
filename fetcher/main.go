@@ -1,15 +1,15 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
 
 	"github.com/streadway/amqp"
 )
+
+const uploadDir = "./upload"
 
 type FileTask struct {
 	FilePath        string `json:"filePath"`
@@ -24,17 +24,31 @@ func main() {
 	defer conn.Close()
 
 	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("Failed to open a channel: %v", err)
+	}
 
 	q, err := ch.QueueDeclare(
-		"file_tasks", // name
+		"file_queue", // name
 		true,         // durable
-		true,         // delete when unused
+		false,        // delete when unused
 		false,        // exclusive
 		false,        // no-wait
 		nil,          // arguments
 	)
 	if err != nil {
 		log.Fatalf("Failed to declare a queue: %v", err)
+	}
+
+	err = ch.QueueBind(
+		q.Name,
+		"file_route",
+		"file_exchange",
+		false,
+		nil,
+	)
+	if err != nil {
+		log.Fatalf("Failed to bind queue: %v", err)
 	}
 
 	msgs, err := ch.Consume(
@@ -50,56 +64,61 @@ func main() {
 		log.Fatalf("Failed to register a consumer: %v", err)
 	}
 
-	forever := make(chan bool)
+	if err := os.MkdirAll(uploadDir, os.ModePerm); err != nil {
+		log.Fatalf("Error creating %s directory\n", uploadDir)
+	}
+
+	quitch := make(chan bool)
 
 	go func() {
 		for i := range msgs {
-			var task FileTask
-			if err := json.Unmarshal(i.Body, &task); err != nil {
-				log.Printf("Failed to unmarshal a message: %v", err)
-				continue
+			fileName := i.Headers["file_name"].(string)
+			fmt.Println("Receive file:", fileName)
+
+			err := os.WriteFile(filepath.Join(uploadDir, fileName), i.Body, 0644)
+			if err != nil {
+				log.Fatalf("Failed to write file: %v", err)
 			}
-			log.Printf("Received a file task: %v", task)
-			processFile(task)
+			fmt.Println("File saved successfully", fileName)
 		}
 	}()
 
 	fmt.Println(" [x] Waiting for messages. To exit press CTRL+C")
-	<-forever
+	<-quitch
 }
 
-func processFile(task FileTask) {
-	fmt.Println("Processing file:", task.FilePath)
+// func processFile(task FileTask) {
+// 	fmt.Println("Processing file:", task.FilePath)
 
-	targetPath := filepath.Join(task.DestinationPath, filepath.Base(task.FilePath))
+// 	targetPath := filepath.Join(task.DestinationPath, filepath.Base(task.FilePath))
 
-	if err := moveFile(task.FilePath, targetPath); err != nil {
-		log.Printf("Failed to move file: %v", err)
-	}
+// 	if err := moveFile(task.FilePath, targetPath); err != nil {
+// 		log.Printf("Failed to move file: %v", err)
+// 	}
 
-	fmt.Printf("Move file %s to %s\n", task.FilePath, task.DestinationPath)
-}
+// 	fmt.Printf("Move file %s to %s\n", task.FilePath, task.DestinationPath)
+// }
 
-func moveFile(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), os.ModePerm); err != nil {
-		return err
-	}
+// func moveFile(src, dst string) error {
+// 	if err := os.MkdirAll(filepath.Dir(dst), os.ModePerm); err != nil {
+// 		return err
+// 	}
 
-	srcFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer srcFile.Close()
+// 	srcFile, err := os.Open(src)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer srcFile.Close()
 
-	dstFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
+// 	dstFile, err := os.Create(dst)
+// 	if err != nil {
+// 		return err
+// 	}
 
-	if _, err := io.Copy(dstFile, srcFile); err != nil {
-		return err
-	}
+// 	if _, err := io.Copy(dstFile, srcFile); err != nil {
+// 		return err
+// 	}
 
-	return os.Remove(src)
+// 	return os.Remove(src)
 
-}
+// }
