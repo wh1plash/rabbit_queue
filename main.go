@@ -28,9 +28,9 @@ type QueueConfig struct {
 	Args       map[string]interface{}
 }
 
-func NewQueue() *QueueConfig {
+func NewQueue(queueName string) *QueueConfig {
 	return &QueueConfig{
-		Name:       "file_queue",
+		Name:       queueName,
 		Durable:    true,
 		AutoDelete: false,
 		Exclusive:  false,
@@ -65,15 +65,15 @@ type ExchangeConfig struct {
 	Args       map[string]interface{}
 }
 
-func NewExchange() *ExchangeConfig {
+func NewExchange(name string) *ExchangeConfig {
 	return &ExchangeConfig{
-		Name:       "file_exchange", // Имя exchange
-		Kind:       "direct",        // Тип exchange
-		Durable:    true,            // Durable
-		AutoDelete: false,           // Auto-deleted
-		Internal:   false,           // Internal
-		NoWait:     false,           // No-wait
-		Args:       nil,             // Arguments
+		Name:       name,     //"file_exchange", // Имя exchange
+		Kind:       "direct", // Тип exchange
+		Durable:    true,     // Durable
+		AutoDelete: false,    // Auto-deleted
+		Internal:   false,    // Internal
+		NoWait:     false,    // No-wait
+		Args:       nil,      // Arguments
 	}
 }
 
@@ -103,14 +103,14 @@ func NewPublishing(config PublishConfig) amqp.Publishing {
 	}
 }
 
-func publishMessage(ch *amqp.Channel, config PublishConfig) error {
+func publishMessage(ch *amqp.Channel, exchange, routingKey string, config PublishConfig) error {
 	message := NewPublishing(config)
 
 	err := ch.Publish(
-		"file_exchange", // exchange
-		"file_route",    // routing key
-		false,           // mandatory
-		false,           // immediate
+		exchange,   // exchange
+		routingKey, // routing key
+		false,      // mandatory
+		false,      // immediate
 		message,
 	)
 	if err != nil {
@@ -120,23 +120,19 @@ func publishMessage(ch *amqp.Channel, config PublishConfig) error {
 	return nil
 }
 
-type ConnectionConfig struct {
-	Url string
-}
-
 type Connection struct {
-	Config *ConnectionConfig
-	Conn   *amqp.Connection
-	Ch     *amqp.Channel
+	Url  string
+	Conn *amqp.Connection
+	Ch   *amqp.Channel
 }
 
-func NewConnectionConfig(url string) *ConnectionConfig {
-	return &ConnectionConfig{
+func NewConnectionConfig(url string) *Connection {
+	return &Connection{
 		Url: url,
 	}
 }
 
-func NewConnection(config *ConnectionConfig) (*Connection, error) {
+func NewConnection(config *Connection) (*Connection, error) {
 	conn, err := amqp.Dial(config.Url)
 	if err != nil {
 		return nil, err
@@ -149,9 +145,9 @@ func NewConnection(config *ConnectionConfig) (*Connection, error) {
 	}
 
 	return &Connection{
-		Config: config,
-		Conn:   conn,
-		Ch:     ch,
+		Url:  config.Url,
+		Conn: conn,
+		Ch:   ch,
 	}, nil
 }
 
@@ -164,6 +160,24 @@ func (c *Connection) Close() {
 	}
 }
 
+func bindQueues(ch *amqp.Channel, binds map[string]string, exchange string) error {
+	for queueName, routingKey := range binds {
+		err := ch.QueueBind(
+			queueName,
+			routingKey,
+			exchange,
+			false,
+			nil,
+		)
+		if err != nil {
+			log.Fatalf("Failed to bind queue: %v", err)
+		}
+		fmt.Printf(" [x] queue \"%s\" bind to \"%s\" with routeng key \"%s\" \n", queueName, exchange, routingKey)
+	}
+	return nil
+
+}
+
 func main() {
 	config := NewConnectionConfig("amqp://guest:guest@localhost:5672/")
 	amqpConn, err := NewConnection(config)
@@ -172,31 +186,37 @@ func main() {
 	}
 	defer amqpConn.Close()
 
-	exchange := NewExchange()
+	exchangeName := "file_exchange"
+
+	exchange := NewExchange(exchangeName)
+
 	err = declareExchange(amqpConn.Ch, exchange)
 	if err != nil {
 		log.Fatalf("Failed to declare an exchange: %v", err)
 	}
 	fmt.Printf(" [x] Exchnge: %s created\n", exchange.Name)
 
-	queue, err := declareQueue(amqpConn.Ch, NewQueue())
-	if err != nil {
-		log.Fatalf("Failed to declare a queue: %v", err)
-	}
-	fmt.Printf(" [x] Queue: %s created\n", queue.Name)
-	fmt.Printf(" [------>] messages in queue \"%s\": %d\n", queue.Name, queue.Messages)
+	queues := []string{"file_queue", "partial_file_queue", "some_reserved_queue"}
+	// routes := []string{"file_route", "partial_file_route", "some_file_route"}
 
-	err = amqpConn.Ch.QueueBind(
-		queue.Name,
-		"file_route",
-		"file_exchange",
-		false,
-		nil,
-	)
-	if err != nil {
-		log.Fatalf("Failed to bind queue: %v", err)
+	binds := map[string]string{"file_queue": "file_route", "partial_file_queue": "partial_file_route", "some_reserved_queue": "some_file_route"}
+	// binding = append(binds, {"file_queue": ""})
+	fmt.Println("<---------------- map: ", binds)
+
+	for _, queue := range queues {
+		curqueue, err := declareQueue(amqpConn.Ch, NewQueue(queue))
+		if err != nil {
+			log.Fatalf("Failed to declare queue %s: %v", queue, err)
+		}
+		fmt.Printf(" [x] Queue: %s created\n", queue)
+		fmt.Printf(" [------>] messages in queue \"%s\": %d\n", curqueue.Name, curqueue.Messages)
 	}
-	fmt.Printf(" [x] queue \"%s\" bind to \"%s\" \n", queue.Name, exchange.Name)
+
+	err = bindQueues(amqpConn.Ch, binds, "file_exchange")
+	if err != nil {
+		log.Fatalf("Failed to binding queues: %v", err)
+	}
+	fmt.Println(" [x] All queues are successfully bound to the exchange")
 
 	stay := make(chan bool)
 	// var wg sync.WaitGroup
@@ -286,9 +306,17 @@ func sendFiles(ch <-chan string, Ch *amqp.Channel) {
 			},
 		}
 
-		err = publishMessage(Ch, messageConfig)
-		if err != nil {
-			log.Fatalf("Failed to publish message: %v", err)
+		if fileName == "1.txt" {
+			err = publishMessage(Ch, "file_exchange", "partial_file_route", messageConfig)
+			if err != nil {
+				fmt.Printf("Error to publish message: %v", err)
+			}
+		} else {
+
+			err = publishMessage(Ch, "file_exchange", "file_route", messageConfig)
+			if err != nil {
+				fmt.Printf("Error to publish message: %v", err)
+			}
 		}
 		fmt.Printf(" [x] File [%s] has been succesfuly send to RabbitMQ\n", fileName)
 
