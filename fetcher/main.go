@@ -9,116 +9,93 @@ import (
 	"github.com/streadway/amqp"
 )
 
-const uploadDir = "./upload"
-
-type FileTask struct {
-	FilePath        string `json:"filePath"`
-	DestinationPath string `json:"destination"`
+type Consumer struct {
+	conn      *amqp.Connection
+	channel   *amqp.Channel
+	queueName string
+	uploadDir string
 }
 
-func main() {
-	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+func NewConsumer(amqpUrl, queueName, uploadDir string) (*Consumer, error) {
+	conn, err := amqp.Dial(amqpUrl)
 	if err != nil {
-		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
-	}
-	defer conn.Close()
+		return nil, fmt.Errorf("failed to connect to Rebbit: %w", err)
 
+	}
 	ch, err := conn.Channel()
 	if err != nil {
-		log.Fatalf("Failed to open a channel: %v", err)
-	}
-
-	q, err := ch.QueueDeclare(
-		"file_queue", // name
-		true,         // durable
-		false,        // delete when unused
-		false,        // exclusive
-		false,        // no-wait
-		nil,          // arguments
-	)
-	if err != nil {
-		log.Fatalf("Failed to declare a queue: %v", err)
-	}
-
-	err = ch.QueueBind(
-		q.Name,
-		"file_route",
-		"file_exchange",
-		false,
-		nil,
-	)
-	if err != nil {
-		log.Fatalf("Failed to bind queue: %v", err)
-	}
-
-	msgs, err := ch.Consume(
-		q.Name, // queue
-		"",     // consumer
-		true,   // auto-ack
-		false,  // exclusive
-		false,  // no-local
-		false,  // no-wait
-		nil,    // args
-	)
-	if err != nil {
-		log.Fatalf("Failed to register a consumer: %v", err)
+		conn.Close()
+		return nil, fmt.Errorf("failed to open channel: %w", err)
 	}
 
 	if err := os.MkdirAll(uploadDir, os.ModePerm); err != nil {
-		log.Fatalf("Error creating %s directory\n", uploadDir)
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("failed to create upload Dir: %w", err)
 	}
 
-	quitch := make(chan bool)
+	return &Consumer{
+		conn:      conn,
+		channel:   ch,
+		queueName: queueName,
+		uploadDir: uploadDir,
+	}, nil
 
-	go func() {
-		for i := range msgs {
-			fileName := i.Headers["file_name"].(string)
-			fmt.Println("Receive file:", fileName)
-
-			err := os.WriteFile(filepath.Join(uploadDir, fileName), i.Body, 0644)
-			if err != nil {
-				log.Fatalf("Failed to write file: %v", err)
-			}
-			fmt.Println("File saved successfully", fileName)
-		}
-	}()
-
-	fmt.Println(" [x] Waiting for messages. To exit press CTRL+C")
-	<-quitch
 }
 
-// func processFile(task FileTask) {
-// 	fmt.Println("Processing file:", task.FilePath)
+func (c *Consumer) Consume() error {
+	msgs, err := c.channel.Consume(
+		c.queueName, //queue
+		"",          //consumer
+		true,        // auto-ack
+		false,       // exclusive
+		false,       // no-local
+		false,       // no-wait
+		nil,         // args
+	)
+	if err != nil {
+		return fmt.Errorf("failed to register a consumer: %w", err)
+	}
+	log.Println(" [x] Waiting for messages. To exit press CTRL+C")
+	for msg := range msgs {
+		fileName, ok := msg.Headers["file_name"].(string)
+		if !ok {
+			log.Println("missing or invalid 'file_name' header")
+			continue
+		}
 
-// 	targetPath := filepath.Join(task.DestinationPath, filepath.Base(task.FilePath))
+		filePath := filepath.Join(c.uploadDir, fileName)
+		if err := os.WriteFile(filePath, msg.Body, 0644); err != nil {
+			log.Printf("failed to write file %s: %v\n", fileName, err)
+		}
+		log.Printf("File saved successfully: %s\n", filePath)
+	}
+	return nil
+}
 
-// 	if err := moveFile(task.FilePath, targetPath); err != nil {
-// 		log.Printf("Failed to move file: %v", err)
-// 	}
+func (c *Consumer) Close() {
+	if c.channel != nil {
+		c.channel.Close()
+	}
+	if c.conn != nil {
+		c.conn.Close()
+	}
+}
 
-// 	fmt.Printf("Move file %s to %s\n", task.FilePath, task.DestinationPath)
-// }
+const (
+	uploadDir   = "./upload"
+	rabbitMQURL = "amqp://guest:guest@localhost:5672/"
+	queueName   = "file_queue"
+)
 
-// func moveFile(src, dst string) error {
-// 	if err := os.MkdirAll(filepath.Dir(dst), os.ModePerm); err != nil {
-// 		return err
-// 	}
+func main() {
+	consumer, err := NewConsumer(rabbitMQURL, queueName, uploadDir)
+	if err != nil {
+		log.Fatalf("error initializing consumer: %v", err)
+	}
+	defer consumer.Close()
 
-// 	srcFile, err := os.Open(src)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer srcFile.Close()
-
-// 	dstFile, err := os.Create(dst)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	if _, err := io.Copy(dstFile, srcFile); err != nil {
-// 		return err
-// 	}
-
-// 	return os.Remove(src)
-
-// }
+	if err := consumer.Consume(); err != nil {
+		log.Fatalf("error consumming messages: %v", err)
+	}
+}
